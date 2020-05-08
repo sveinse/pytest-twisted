@@ -201,6 +201,7 @@ def _marked_async_fixture(mark):
 _mark_attribute_name = '_pytest_twisted_mark'
 async_fixture = _marked_async_fixture('async_fixture')
 async_yield_fixture = _marked_async_fixture('async_yield_fixture')
+auto_clock = _marked_async_fixture('auto_clock')
 
 
 def pytest_fixture_setup(fixturedef, request):
@@ -237,6 +238,12 @@ def _async_pytest_fixture_setup(fixturedef, request, mark):
         _tracking.async_yield_fixture_cache[request.param_index] = coroutine
         arg_value = yield defer.ensureDeferred(
             coroutine.__anext__(),
+        )
+    elif mark == 'auto_clock':
+        # HACK! Need to find out if there any places where this can be stored safely
+        setattr(fixturedef, '_pytest_clock', True)
+        arg_value = yield defer.ensureDeferred(
+            fixture_function(**kwargs)
         )
     else:
         raise UnrecognizedCoroutineMarkError.from_mark(mark=mark)
@@ -319,6 +326,20 @@ def pytest_pyfunc_call(pyfuncitem):
     return not None
 
 
+async def _clock_runner(func, clock):
+    d = defer.ensureDeferred(func)
+
+    while 1:
+        calls = clock.getDelayedCalls()
+        if d.called:
+            return await d
+        if not calls:
+            raise RuntimeError("twisted reactor idle")
+
+        amount = calls[0].time - clock.seconds()
+        clock.advance(amount)
+
+
 @defer.inlineCallbacks
 def _async_pytest_pyfunc_call(pyfuncitem):
     """Run test function."""
@@ -330,7 +351,24 @@ def _async_pytest_pyfunc_call(pyfuncitem):
 
     maybe_mark = _get_mark(pyfuncitem.obj)
     if maybe_mark == 'async_test':
-        result = yield defer.ensureDeferred(pyfuncitem.obj(**kwargs))
+
+        hasclock = False
+        clock = None
+
+        # Determine if the fixture has used a fixture with the 'auto_clock' decorator
+        fixturenames = pyfuncitem.fixturenames
+        for name in fixturenames:
+            for fixture in pyfuncitem._fixtureinfo.name2fixturedefs[name]:
+                if hasattr(fixture, '_pytest_clock'):
+                    hasclock = True
+                    clock = kwargs[name]
+
+        func = pyfuncitem.obj(**kwargs)
+        if hasclock:
+            result = yield defer.ensureDeferred(_clock_runner(func, clock))
+        else:
+            result = yield defer.ensureDeferred(func)
+
     elif maybe_mark == 'inline_callbacks_test':
         result = yield pyfuncitem.obj(**kwargs)
     else:
